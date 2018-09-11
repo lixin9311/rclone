@@ -901,9 +901,7 @@ func (o *Object) setMetadata(info os.FileInfo) error {
 func (o *Object) lstat() error {
 	info, err := o.fs.lstat(o.path)
 	if err == nil {
-		if err := o.setMetadata(info); err != nil {
-			return err
-		}
+		err = o.setMetadata(info)
 	}
 	return err
 }
