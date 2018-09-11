@@ -49,6 +49,13 @@ func init() {
 			ShortOpt: "L",
 			Advanced: true,
 		}, {
+			Name:     "copy_device_files",
+			Help:     "Copy the device files.",
+			Default:  false,
+			NoPrefix: true,
+			ShortOpt: "D",
+			Advanced: true,
+		}, {
 			Name:     "skip_links",
 			Help:     "Don't warn about skipped symlinks.",
 			Default:  false,
@@ -78,12 +85,13 @@ func init() {
 
 // Options defines the configuration for this backend
 type Options struct {
-	FollowSymlinks bool `config:"copy_links"`
-	SkipSymlinks   bool `config:"skip_links"`
-	NoUTFNorm      bool `config:"no_unicode_normalization"`
-	NoCheckUpdated bool `config:"no_check_updated"`
-	NoUNC          bool `config:"nounc"`
-	OneFileSystem  bool `config:"one_file_system"`
+	FollowSymlinks  bool `config:"copy_links"`
+	CopyDeviceFiles bool `config:"copy_device_files"`
+	SkipSymlinks    bool `config:"skip_links"`
+	NoUTFNorm       bool `config:"no_unicode_normalization"`
+	NoCheckUpdated  bool `config:"no_check_updated"`
+	NoUNC           bool `config:"nounc"`
+	OneFileSystem   bool `config:"one_file_system"`
 }
 
 // Fs represents a local filesystem rooted at root
@@ -151,7 +159,7 @@ func NewFs(name, root string, m configmap.Mapper) (fs.Fs, error) {
 	if err == nil {
 		f.dev = readDevice(fi, f.opt.OneFileSystem)
 	}
-	if err == nil && fi.Mode().IsRegular() {
+	if err == nil && (fi.Mode().IsRegular() || fi.Mode()&(os.ModeDevice) != 0) {
 		// It is a file, so use the parent as the root
 		f.root = filepath.Dir(f.root)
 		// return an error with an fs which points to the parent
@@ -211,7 +219,9 @@ func (f *Fs) newObject(remote, dstPath string) *Object {
 func (f *Fs) newObjectWithInfo(remote, dstPath string, info os.FileInfo) (fs.Object, error) {
 	o := f.newObject(remote, dstPath)
 	if info != nil {
-		o.setMetadata(info)
+		if err := o.setMetadata(info); err != nil {
+			return nil, err
+		}
 	} else {
 		err := o.lstat()
 		if err != nil {
@@ -691,9 +701,14 @@ func (o *Object) Storable() bool {
 			fs.Logf(o, "Can't follow symlink without -L/--copy-links")
 		}
 		return false
-	} else if mode&(os.ModeNamedPipe|os.ModeSocket|os.ModeDevice) != 0 {
+	} else if mode&(os.ModeNamedPipe|os.ModeSocket) != 0 {
 		fs.Logf(o, "Can't transfer non file/directory")
 		return false
+	} else if mode&(os.ModeDevice) != 0 {
+		if !o.fs.opt.CopyDeviceFiles {
+			fs.Logf(o, "Can't transfer non device file without -D/--copy-device-files")
+			return false
+		}
 	} else if mode&os.ModeDir != 0 {
 		// fs.Debugf(o, "Skipping directory")
 		return false
@@ -718,8 +733,10 @@ func (file *localOpenFile) Read(p []byte) (n int, err error) {
 		if err != nil {
 			return 0, errors.Wrap(err, "can't read status of source file while transferring")
 		}
-		if file.o.size != fi.Size() {
-			return 0, errors.Errorf("can't copy - source file is being updated (size changed from %d to %d)", file.o.size, fi.Size())
+		if fi.Mode()&os.ModeDevice == 0 {
+			if file.o.size != fi.Size() {
+				return 0, errors.Errorf("can't copy - source file is being updated (size changed from %d to %d)", file.o.size, fi.Size())
+			}
 		}
 		if !file.o.modTime.Equal(fi.ModTime()) {
 			return 0, errors.Errorf("can't copy - source file is being updated (mod time changed from %v to %v)", file.o.modTime, fi.ModTime())
@@ -853,25 +870,40 @@ func (o *Object) Update(in io.Reader, src fs.ObjectInfo, options ...fs.OpenOptio
 }
 
 // setMetadata sets the file info from the os.FileInfo passed in
-func (o *Object) setMetadata(info os.FileInfo) {
+func (o *Object) setMetadata(info os.FileInfo) error {
 	// Don't overwrite the info if we don't need to
 	// this avoids upsetting the race detector
-	if o.size != info.Size() {
-		o.size = info.Size()
-	}
 	if !o.modTime.Equal(info.ModTime()) {
 		o.modTime = info.ModTime()
 	}
 	if o.mode != info.Mode() {
 		o.mode = info.Mode()
 	}
+	if o.mode&os.ModeDevice != 0 && o.mode&os.ModeCharDevice == 0 {
+		size, err := getDeviceSize(o.path)
+		if err != nil {
+			if os.IsPermission(err) {
+				return err
+			}
+		}
+		if o.size != size {
+			o.size = size
+		}
+	} else {
+		if o.size != info.Size() {
+			o.size = info.Size()
+		}
+	}
+	return nil
 }
 
 // Stat a Object into info
 func (o *Object) lstat() error {
 	info, err := o.fs.lstat(o.path)
 	if err == nil {
-		o.setMetadata(info)
+		if err := o.setMetadata(info); err != nil {
+			return err
+		}
 	}
 	return err
 }
